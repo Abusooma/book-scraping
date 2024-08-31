@@ -1,128 +1,113 @@
 from loguru import logger
+import aiohttp
+import asyncio
 from urllib.parse import urljoin
 from typing import Optional, List
 import re
-import requests
 from selectolax.parser import HTMLParser
 import sys
 
-# Enlever le logger par defaut
+# Remove default logger
 logger.remove()
 
-# Ajouter le logger dans un fichier dans le disque
+# Add logger to a file on disk
 logger.add("fichier.log", rotation="500kb", level="WARNING")
 
-# Affichage des log dans la console
+# Display logs in the console
 logger.add(sys.stderr, level="INFO")
 
 BASE_URL = "https://books.toscrape.com/"
 
-def get_book_price(url: str) -> float:
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
 
-        tree = HTMLParser(response.text)
+async def get_book_price(url: str, session: aiohttp.ClientSession) -> float:
+    try:
+        async with session.get(url) as response:
+            response.raise_for_status()
+            text = await response.text()  # Correction: Added parentheses
+
+        tree = HTMLParser(text)
         price = extract_price_from_page(tree)
         stock = extract_stock_quantity_from_page(tree)
         return price * stock
-    except requests.exceptions.RequestException as e:
+    except aiohttp.ClientError as e:
         logger.error(f"Erreur lors de la requête HTTP: {e}")
         return 0.0
 
+
 def extract_price_from_page(tree: HTMLParser) -> float:
     try:
-        price_node = tree.css_first('p.price_color')
-        if price_node:
+        if price_node := tree.css_first('p.price_color'):
             price_text = price_node.text().strip()
             price_str = re.findall(r'[0-9.]+', price_text)
             return float(price_str[0])
         else:
-            logger.error("Aucun noeud trouvé pour l'attribut 'p.price_color' ")
+            logger.error("Aucun noeud trouvé pour l'attribut 'p.price_color'")
             return 0.0
-    except ValueError as e:
-        logger.error("Le prix trouvé n'est pas un nombre")
-        return 0.0
-    except IndexError as e:
-        logger.error("Le prix trouvé est une liste vide")
-        return 0.0
-    except Exception as e:
-        logger.error(f"Erreur est survenue lors de la recuperation du prix: {e}")
+    except (ValueError, IndexError) as e:
+        logger.error(f"Erreur lors de l'extraction du prix: {e}")
         return 0.0
 
 
 def extract_stock_quantity_from_page(tree: HTMLParser) -> int:
     try:
-        stock_node = tree.css_first('p.instock.availability')
-        if stock_node:
+        if stock_node := tree.css_first('p.instock.availability'):
             stock_node_text = stock_node.text().strip()
             return int(re.findall(r'[0-9]+', stock_node_text)[0])
-    except ValueError as e:
-        logger.error("Le format du stock est invalide")
+        else:
+            logger.error(
+                "Aucun noeud trouvé pour l'attribut 'p.instock.availability'")
+            return 0
+    except (ValueError, IndexError) as e:
+        logger.error(f"Erreur lors de l'extraction de la quantité: {e}")
         return 0
-    except IndexError as e:
-        logger.error("Le regex a retourné une liste vide")
-        return 0
-    except Exception as e:
-        logger.error(f"Une erreur generale s'est produite lors de l'extraction de la quantité: {e}")
-        return 0
-    
 
-def get_all_books_urls_on_page(tree: HTMLParser) -> List[str]:
+
+def get_all_books_urls_on_page(url: str, tree: HTMLParser) -> List[str]:
     try:
         books_urls_nodes = tree.css("h3 > a")
-        return [urljoin(BASE_URL, link.attributes.get('href')) for link in books_urls_nodes if 'href' in link.attributes]     
+        return [urljoin(url, link.attributes.get('href')) for link in books_urls_nodes if 'href' in link.attributes]
     except Exception as e:
-        logger.error(f"Une erreur lors de l'extraction des URLS {e}")
+        logger.error(f"Une erreur lors de l'extraction des URLs: {e}")
         return []
-    
 
-def get_next_page_url(category_url: str, tree: HTMLParser) -> Optional[str]:
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Une Erreur HTTP est survenue {e}")
-        return None
-    
-    tree = HTMLParser(response.text)
+
+async def get_next_page_url(category_url: str, tree: HTMLParser) -> Optional[str]:
     next_page_node = tree.css_first('li.next > a')
     if next_page_node and 'href' in next_page_node.attributes:
         return urljoin(category_url, next_page_node.attributes['href'])
-    
+
     logger.info("Aucun bouton next sur cette page")
     return None
 
-def get_all_books_urls(url: str) -> List[str]:
+
+async def get_all_books_urls(url: str, session: aiohttp.ClientSession) -> List[str]:
     urls = []
 
-    while True:
+    while url:
         try:
-            r = requests.get(url)
-            r.raise_for_status()
-        except requests.exceptions.RequestException as e:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                text = await response.text()
+        except aiohttp.ClientError as e:
             logger.error(f"Une erreur HTTP s'est produite sur l'url : {url}")
-            continue
-
-        tree = HTMLParser(r.text)
-        books_urls_on_page = get_all_books_urls_on_page(tree=tree)
-        urls.extend(books_urls_on_page)
-
-        next_page_url = get_next_page_url(url, tree)
-
-        if not next_page_url:
             break
 
-        url = next_page_url
-    
+        tree = HTMLParser(text)
+        books_urls_on_page = get_all_books_urls_on_page(url, tree=tree)
+        urls.extend(books_urls_on_page)
+
+        url = await get_next_page_url(url, tree)
+
     return urls
 
 
-
+async def main():
+    async with aiohttp.ClientSession() as session:
+        all_books_urls = await get_all_books_urls(BASE_URL, session)
+        tasks = [get_book_price(url, session) for url in all_books_urls]
+        total_price = sum(await asyncio.gather(*tasks))
+        logger.info(f"Prix total de tous les livres: {total_price}")
+        return total_price
 
 if __name__ == '__main__':
-    url = "https://books.toscrape.com/catalogue/category/books/sequential-art_5/page-2.html"
-    response = requests.get(url)
-    tree = HTMLParser(response.text)
-    print(get_next_page_url(category_url=url, tree=tree))
-   
+    asyncio.run(main())
